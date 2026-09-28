@@ -1,0 +1,36 @@
+# Operating system
+.DS_Store
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Secrets and local configuration
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+credentials.json
+secrets.json
+
+# Local recordings and private analysis files
+*.mp4
+*.webm
+*.mov
+*.avi
+*.mkv
+*.m4v
+recordings/
+private/
+exports/
+
+# Dependencies and logs
+node_modules/
+npm-debug.log*
+*.log

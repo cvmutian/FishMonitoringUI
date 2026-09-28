@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="水下鱼群智能监测系统界面原型，用于展示视频接入、鱼体关键点与群体行为统计。" />
+  <title>水下鱼群智能监测系统</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">🐟</div>
+        <div>
+          <h1>水下鱼群智能监测系统</h1>
+          <p>姿态检测 · 行为分析 · 状态记录</p>
+        </div>
+      </div>
+      <div class="top-status">
+        <span class="badge" id="sourceBadge">数据源未接入</span><span class="badge" id="runBadge">监测未启动</span>
+        <span class="clock" id="clock">--:--:--</span>
+      </div>
+    </header>
+
+    <aside class="sidebar">
+      <section class="panel nav-panel">
+        <h2>功能导航</h2>
+        <button class="nav-item active" data-target="overview">视频与姿态</button>
+        <button class="nav-item" data-target="pose">个体姿态</button>
+        <button class="nav-item" data-target="behavior">行为统计</button>
+        <button class="nav-item" data-target="alerts">状态记录</button>
+        <button class="nav-item" data-target="system">运行状态</button>
+      </section>
+
+      <section class="panel pipeline-panel">
+        <h2>系统流程</h2>
+        <div class="pipeline-step"><span>01</span>视频接入与预处理</div>
+        <div class="pipeline-step"><span>02</span>鱼体检测与关键点估计</div>
+        <div class="pipeline-step"><span>03</span>实例关联与姿态序列</div>
+        <div class="pipeline-step"><span>04</span>行为分类与群体统计</div>
+        <div class="pipeline-step"><span>05</span>状态提示与记录</div>
+      </section>
+
+      <section class="panel source-panel"><h2>数据源与监测</h2>
+        <label class="field-label" for="sourceSelect">输入方式</label>
+        <select id="sourceSelect" class="field-select"><option value="none">请选择数据源</option><option value="file">本地视频</option><option value="camera">本机摄像头预览</option><option value="demo">界面演示</option></select>
+        <label class="file-btn secondary" id="videoFileLabel">选择视频文件<input type="file" id="videoInput" accept="video/*"></label>
+        <label class="file-btn secondary" id="jsonFileLabel">导入分析结果 JSON<input type="file" id="jsonInput" accept=".json,application/json"></label>
+        <div class="source-controls"><button id="togglePlayBtn" disabled>开始监测</button><button id="stopBtn" class="ghost" disabled>停止</button></div>
+        <p class="hint" id="sourceHint">本地视频需配套分析结果才能显示检测与行为信息。</p>
+      </section>
+      <section class="panel threshold-panel">
+        <h2>参数配置</h2>
+        <label for="activityThreshold">活动强度提示阈值 <b id="activityValue">0.72</b></label>
+        <input id="activityThreshold" type="range" min="0.3" max="1" value="0.72" step="0.01" />
+        <label for="turnThreshold">急转避让占比提示阈值 <b id="turnValue">18%</b></label>
+        <input id="turnThreshold" type="range" min="5" max="40" value="18" step="1" />
+        <label for="confThreshold">关键点置信度下限 <b id="confValue">0.50</b></label>
+        <input id="confThreshold" type="range" min="0" max="1" value="0.50" step="0.01" />
+        <p class="hint">阈值用于界面状态提示。</p>
+      </section>
+    </aside>
+
+    <main class="dashboard">
+      <section class="hero-card panel" id="overview">
+        <div class="section-title">
+          <div>
+            <h2>水下视频与姿态检测</h2><p id="modeLabel">等待选择数据源</p>
+          </div>
+          <div class="control-group">
+            <span id="videoName" class="video-name">未导入视频</span>
+            <label class="check-label"><input id="showBoxes" type="checkbox" checked> 检测框</label>
+            <label class="check-label"><input id="showSkeleton" type="checkbox" checked> 关键点与骨架</label>
+          </div>
+        </div>
+
+        <div class="video-stage" id="videoStage">
+          <video id="video" muted playsinline controls></video>
+          <canvas id="poseCanvas"></canvas>
+          <div class="empty-video" id="emptyVideo">
+            <div class="sonar"></div>
+            <h3>视频接入与预处理区域</h3>
+            <p>可选择本地视频或本机摄像头预览；也可进入界面演示</p>
+          </div>
+          <span class="stage-tag" id="stageTag">未接入</span>
+        </div>
+      </section>
+
+      <section class="metric-grid">
+        <article class="metric-card panel">
+          <span>当前鱼体数量</span>
+          <strong id="fishCount">-</strong>
+        </article>
+        <article class="metric-card panel">
+          <span>整体活动强度</span>
+          <strong id="activityScore">-</strong>
+          <small>由分析结果提供，范围 0–1</small>
+        </article>
+        <article class="metric-card panel">
+          <span>鱼群主导行为</span>
+          <strong id="behaviorState">-</strong>
+          <small id="behaviorRatio">-</small>
+        </article>
+        <article class="metric-card panel risk-card" id="riskCard">
+          <span>状态提示</span>
+          <strong id="riskLevel">-</strong>
+          <small id="riskReason">等待有效分析数据</small>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <article class="panel pose-card" id="pose"><div class="section-title compact"><h2>个体姿态与行为</h2><span class="mini-tag">11 个关键点</span></div><p class="panel-note">按鱼体 ID 查看当前帧结果</p><div class="individual-table"><div class="individual-head"><span>鱼体 ID</span><span>关键点</span><span>行为状态</span></div><div id="individualRows"><p class="empty-data">等待分析结果</p></div></div></article>
+        <article class="panel chart-card" id="behavior">
+          <div class="section-title compact">
+            <h2>鱼群行为分布</h2><span class="mini-tag" id="behaviorWindowLabel">2 秒窗口</span>
+          </div>
+          <canvas id="behaviorChart"></canvas>
+          <div class="legend-row">
+            <span><i class="dot calm"></i>低活动</span>
+            <span><i class="dot normal"></i>正常游动</span>
+            <span><i class="dot fast"></i>快速游动</span>
+            <span><i class="dot sharp"></i>急转避让</span>
+          </div>
+        </article>
+
+        <article class="panel chart-card" id="trend">
+          <div class="section-title compact">
+            <h2>活动状态变化趋势</h2>
+            <span class="mini-tag">最近 60 个有效样本</span>
+          </div>
+          <canvas id="activityChart"></canvas>
+        </article>
+
+        <article class="panel status-card" id="system">
+          <div class="section-title compact">
+            <h2>工控机分析链路</h2>
+          </div>
+          <p class="panel-note">模型推理由工控机端服务提供；此处展示已接入的数据状态。</p><div class="status-list">
+            <div><span>视频流</span><b id="statusVideo" class="muted">未接入</b></div>
+            <div><span>姿态模型</span><b id="statusPose" class="muted">待机中</b></div>
+            <div><span>行为分析</span><b id="statusBehavior" class="muted">待机中</b></div>
+            <div><span>推理方案</span><b id="engine">未连接</b></div>
+            <div><span>推理延迟</span><b id="latency">-</b></div>
+            <div><span>关键点平均置信度</span><b id="kpConf">-</b></div>
+          </div>
+        </article>
+
+        <article class="panel alert-card" id="alerts">
+          <div class="section-title compact">
+            <h2>状态事件与运行日志</h2>
+            <button id="clearLog" class="ghost">清空记录</button>
+          </div>
+          <div class="log-table">
+            <div class="log-head"><span>时间</span><span>事件类型</span><span>说明</span></div>
+            <div id="eventLog"></div>
+          </div>
+        </article>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
