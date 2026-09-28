@@ -34,3 +34,6 @@ exports/
 node_modules/
 npm-debug.log*
 *.log
+
+# Published as a separate repository
+behavior_analysis/
