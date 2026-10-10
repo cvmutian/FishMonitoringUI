@@ -9,6 +9,8 @@ index.html
 styles.css
 app.js
 server.py
+pose_adapter.py
+analysis_task.py
 examples/sample-analysis.json
 ```
 

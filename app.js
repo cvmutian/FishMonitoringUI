@@ -1,7 +1,7 @@
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => document.querySelectorAll(selector);
 const LABELS = ['低活动', '正常游动', '快速游动', '急转避让'];
-const SKELETON = [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7], [7, 8], [8, 9], [9, 10], [10, 0]];
+const SKELETON = [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7], [7, 8], [1, 10], [10, 9], [9, 8]];
 const API = {
   status: '/api/status',
   source: '/api/source',
@@ -22,8 +22,8 @@ const STRIDE_SECONDS = STRIDE_FRAMES / FPS;
 const state = {
   source: 'none', running: false, paused: false, mode: 'idle', backend: false, socket: null,
   data: null, frame: null, series: [], stream: null, objectUrl: null, demoTick: 0, demoFish: [],
-  lastBehaviorTime: null, alertKey: null, liveDetections: [], behaviorById: {}, service: null,
-  applyingParams: false
+  lastBehaviorTime: null, lastActivity: null, alertKey: null, liveDetections: [], behaviorById: {}, service: null,
+  applyingParams: false, videoFile: null, uploadId: '', poseBuffer: [], pendingBehavior: []
 };
 const video = $('#video');
 const stage = $('#videoStage');
@@ -44,11 +44,19 @@ function resizeCanvas(canvas) {
   canvas.getContext('2d').setTransform(ratio, 0, 0, ratio, 0, 0);
 }
 
+function authHeaders(extra = {}) {
+  const headers = { ...extra };
+  const token = sessionStorage.getItem('monitorToken');
+  if (token) headers['X-Monitor-Token'] = token;
+  return headers;
+}
+
 async function request(path, options = {}) {
+  const headers = authHeaders({ 'Content-Type': 'application/json', ...(options.headers || {}) });
   const response = await fetch(path, {
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
     cache: 'no-store',
-    ...options
+    ...options,
+    headers
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -115,10 +123,11 @@ function updateSourceUI() {
   $('#behaviorWindowLabel').textContent = windowLabel();
   const service = state.service || {};
   setStatus('#statusVideo', !state.backend ? '未连接' : connected ? '已接入' : '未接入', connected && state.backend);
-  const poseText = state.mode === 'demo' && state.running ? '演示数据' : state.mode === 'playback' && state.running ? (formatTest ? '测试数据' : '导入结果') : service.poseModel || '模型未加载';
-  const behaviorText = state.mode === 'demo' && state.running ? '演示数据' : state.mode === 'playback' && state.running ? (formatTest ? '测试数据' : '导入结果') : service.behaviorModel || '模型未加载';
-  setStatus('#statusPose', poseText, poseText === '已加载' || poseText === '导入结果');
-  setStatus('#statusBehavior', behaviorText, behaviorText === '已加载' || behaviorText === '导入结果');
+  const poseText = state.mode === 'demo' && state.running ? '演示数据' : state.mode === 'playback' && state.running ? (formatTest ? '测试数据' : '导入结果') : service.poseModel || '未找到模型文件';
+  const behaviorText = state.mode === 'demo' && state.running ? '演示数据' : state.mode === 'playback' && state.running ? (formatTest ? '测试数据' : '导入结果') : service.behaviorModel || '未找到模型文件';
+  const readyStatus = value => value === '可执行推理' || value === '导入结果' || value === '测试数据' || value === '演示数据';
+  setStatus('#statusPose', poseText, readyStatus(poseText));
+  setStatus('#statusBehavior', behaviorText, readyStatus(behaviorText));
   const engine = state.mode === 'demo' ? '模拟' : formatTest ? '测试数据' : service.engine || state.data?.engine || '未加载';
   $('#engine').textContent = engine;
 }
@@ -127,9 +136,12 @@ function clearResults() {
   state.frame = null;
   state.series = [];
   state.lastBehaviorTime = null;
+  state.lastActivity = null;
   state.alertKey = null;
   state.liveDetections = [];
   state.behaviorById = {};
+  state.poseBuffer = [];
+  state.pendingBehavior = [];
   state.demoFish = [];
   ['#fishCount', '#activityScore', '#behaviorState', '#behaviorRatio', '#kpConf', '#latency'].forEach(id => $(id).textContent = '—');
   $('#riskLevel').textContent = '—';
@@ -154,6 +166,8 @@ function releaseLocalMedia() {
     state.objectUrl = null;
   }
   state.data = null;
+  state.videoFile = null;
+  state.uploadId = '';
   $('#videoName').textContent = '未导入视频';
   $('#videoInput').value = '';
   $('#jsonInput').value = '';
@@ -203,12 +217,20 @@ async function openPreviewCamera() {
 
 function normalizeJSON(raw) {
   if (!raw || !Array.isArray(raw.frames) || !raw.frames.length) throw Error('JSON 需要非空 frames 数组。');
+  const windowSeconds = finite(raw.windowSeconds) ? raw.windowSeconds : WINDOW_SECONDS;
   const frames = raw.frames.map((frame, index) => {
     if (!finite(frame.time) || frame.time < 0 || !Array.isArray(frame.detections)) throw Error(`第 ${index + 1} 帧缺少有效 time 或 detections。`);
     frame.detections.forEach((det, detIndex) => {
       if (!det || typeof det !== 'object') throw Error(`第 ${index + 1} 帧第 ${detIndex + 1} 个鱼体数据无效。`);
       if (det.bbox && (!Array.isArray(det.bbox) || det.bbox.length !== 4 || !det.bbox.every(finite))) throw Error(`第 ${index + 1} 帧检测框无效。`);
       if (det.keypoints && (!Array.isArray(det.keypoints) || det.keypoints.length !== 11)) throw Error(`第 ${index + 1} 帧需要 11 个关键点。`);
+      const hasBehavior = Number.isInteger(det.behavior) || LABELS.includes(det.behavior);
+      if (!hasBehavior) return;
+      if (frame.time + 1e-6 < windowSeconds) throw Error(`第 ${index + 1} 帧的行为结果早于 ${windowSeconds} 秒窗口。`);
+      ['window_start_frame', 'window_end_frame', 'window_start_time', 'window_end_time'].forEach(key => {
+        if (!finite(det[key]) && !Number.isInteger(det[key])) throw Error(`第 ${index + 1} 帧行为结果缺少 ${key}。`);
+      });
+      if (det.window_end_time > frame.time + 1e-3 || det.window_start_time > det.window_end_time) throw Error(`第 ${index + 1} 帧行为窗口时间无效。`);
     });
     return frame;
   }).sort((a, b) => a.time - b.time);
@@ -226,18 +248,32 @@ function normalizeJSON(raw) {
 }
 
 function nearestFrame(seconds) {
-  const frames = state.data.frames;
-  let low = 0;
-  let high = frames.length;
-  while (low < high) {
-    const mid = (low + high) >>> 1;
-    if (frames[mid].time < seconds) low = mid + 1;
-    else high = mid;
-  }
-  const later = frames[Math.min(low, frames.length - 1)];
-  const earlier = frames[Math.max(low - 1, 0)];
-  const closest = Math.abs(later.time - seconds) < Math.abs(earlier.time - seconds) ? later : earlier;
-  return Math.abs(closest.time - seconds) <= STRIDE_SECONDS / 2 ? closest : null;
+  const frames = state.data.frames.filter(frame => frame.time <= seconds + 1e-3);
+  if (!frames.length) return null;
+  const frame = frames[frames.length - 1];
+  return seconds - frame.time <= STRIDE_SECONDS ? frame : null;
+}
+
+function behaviorVisible(det, time) {
+  if (!det || (!Number.isInteger(det.behavior) && !LABELS.includes(det.behavior))) return false;
+  if (!finite(det.window_end_time) || !finite(det.window_start_time)) return false;
+  if (det.window_end_time > time + 1e-3) return false;
+  return time - det.window_end_time <= STRIDE_SECONDS + 1e-3;
+}
+
+function withVisibleBehavior(frame, time) {
+  if (!frame) return null;
+  return {
+    ...frame,
+    videoWidth: frame.videoWidth || state.data?.videoWidth,
+    videoHeight: frame.videoHeight || state.data?.videoHeight,
+    detections: frame.detections.map(det => {
+      if (behaviorVisible(det, time)) return det;
+      const copy = { ...det };
+      delete copy.behavior;
+      return copy;
+    })
+  };
 }
 
 function behaviorCounts(detections) {
@@ -487,69 +523,167 @@ function stepDemo() {
   const score = clamp(0.52 + Math.sin(state.demoTick * 0.28) * 0.17);
   const detections = state.demoFish.map((fish, index) => ({
     id: index + 1,
-    behavior: index % 4,
+    behavior: time + 1e-6 >= WINDOW_SECONDS ? index % 4 : undefined,
     keypoints: Array.from({ length: 11 }, () => [0, 0, 0.9])
   }));
   const counts = behaviorCounts(detections);
-  state.frame = { time, detections, metrics: { fishCount: detections.length, activityScore: score, behavior: counts } };
+  state.frame = { time, detections, metrics: { fishCount: detections.length, activityScore: time + 1e-6 >= WINDOW_SECONDS ? score : null, behavior: counts } };
   $('#fishCount').textContent = String(detections.length);
   renderIndividuals(detections);
-  applyBehaviorSummary(counts, score, time, null);
-  pushActivity(time, score);
+  applyBehaviorSummary(counts, time + 1e-6 >= WINDOW_SECONDS ? score : null, time, null);
+  if (time + 1e-6 >= WINDOW_SECONDS) pushActivity(time, score);
   drawOverlay();
 }
 
 function syncFileFrame() {
-  if (!state.running || state.paused || state.mode !== 'playback' || !state.data || !video.videoWidth) return;
-  const time = video.currentTime;
-  if (state.lastBehaviorTime !== null && time < state.lastBehaviorTime - STRIDE_SECONDS) {
-    state.series = state.series.filter(point => point.t <= time);
+  if (state.paused || state.mode !== 'playback' || !state.data || !video.videoWidth) return;
+  relocatePlayback(video.currentTime, state.running);
+}
+
+function relocatePlayback(time, record) {
+  if (state.lastBehaviorTime !== null && time < state.lastBehaviorTime - 0.05) {
+    state.series = [];
     state.lastBehaviorTime = null;
     state.alertKey = null;
   }
   const frame = nearestFrame(time);
-  renderPose(frame ? { ...frame, videoWidth: state.data.videoWidth, videoHeight: state.data.videoHeight } : null);
-  if (!frame || frame.time === state.lastBehaviorTime) return;
-  const counts = behaviorCounts(frame.detections);
-  if (!counts && !frame.metrics) return;
+  const view = frame ? withVisibleBehavior(frame, time) : null;
+  renderPose(view);
+  const countsNow = view ? behaviorCounts(view.detections) : null;
+  if (!record) {
+    applyBehaviorSummary(countsNow, countsNow ? frame?.metrics?.activityScore : null, time, null);
+    return;
+  }
+  (state.data.frames || []).forEach(item => {
+    if (item.time > time + 1e-3 || !finite(item.metrics?.activityScore)) return;
+    if (!item.detections.some(det => behaviorVisible(det, time))) return;
+    pushActivity(item.time, item.metrics.activityScore);
+  });
+  if (!view || !view.detections.some(det => Number.isInteger(det.behavior) || LABELS.includes(det.behavior))) {
+    if (state.lastBehaviorTime === null) applyBehaviorSummary(null, null, time, null);
+    return;
+  }
+  if (frame.time === state.lastBehaviorTime) return;
   state.lastBehaviorTime = frame.time;
-  renderIndividuals(frame.detections);
-  applyBehaviorSummary(counts || frame.metrics?.behavior, frame.metrics?.activityScore, frame.time, frame.metrics?.latencyMs);
-  if (finite(frame.metrics?.activityScore)) pushActivity(frame.time, frame.metrics.activityScore);
+  const counts = behaviorCounts(view.detections);
+  renderIndividuals(view.detections);
+  applyBehaviorSummary(counts, frame.metrics?.activityScore, frame.time, frame.metrics?.latencyMs);
+}
+
+function behaviorRecordValid(record, time) {
+  if (!record || !finite(record.window_end_time)) return false;
+  if (record.window_end_time > time + 1e-3) return false;
+  if (time - record.window_end_time > STRIDE_SECONDS + 1e-3) return false;
+  return Number.isInteger(record.behavior) && record.behavior >= 0 && record.behavior < 4;
 }
 
 function applyLivePose(message) {
   if (!state.running || state.paused || state.mode !== 'analyze') return;
-  const seen = new Set((message.detections || []).map(det => det.id));
-  Object.keys(state.behaviorById).forEach(id => { if (!seen.has(Number(id)) && !seen.has(id)) delete state.behaviorById[id]; });
-  const detections = (message.detections || []).map(det => ({ ...det, behavior: state.behaviorById[det.id]?.behavior }));
-  state.frame = { detections, videoWidth: message.videoWidth, videoHeight: message.videoHeight, metrics: { fishCount: message.fishCount } };
+  const entry = {
+    time: message.time,
+    videoWidth: message.videoWidth,
+    videoHeight: message.videoHeight,
+    detections: message.detections || [],
+    metrics: { fishCount: message.fishCount },
+    latencyMs: message.latencyMs
+  };
+  state.poseBuffer.push(entry);
+  state.poseBuffer = state.poseBuffer.filter(item => message.time - item.time <= WINDOW_SECONDS * 4).slice(-180);
+  if (finite(message.latencyMs)) $('#latency').textContent = `${Number(message.latencyMs).toFixed(1)} ms`;
+  if (state.source === 'file') {
+    syncAnalyzeFrame();
+    return;
+  }
+  renderLiveAt(message.time, entry);
+}
+
+function renderLiveAt(time, poseFrame) {
+  const detectionsSource = poseFrame?.detections || [];
+  if (poseFrame) {
+    const seen = new Set(detectionsSource.map(det => det.id));
+    Object.keys(state.behaviorById).forEach(id => {
+      const key = Number.isNaN(Number(id)) ? id : Number(id);
+      if (!seen.has(key) && !seen.has(id)) delete state.behaviorById[id];
+      else if (!behaviorRecordValid(state.behaviorById[id], time)) delete state.behaviorById[id];
+    });
+  }
+  const detections = detectionsSource.map(det => {
+    const record = state.behaviorById[det.id];
+    return behaviorRecordValid(record, time) ? { ...det, behavior: record.behavior } : { ...det, behavior: undefined };
+  });
+  state.frame = { detections, videoWidth: poseFrame?.videoWidth, videoHeight: poseFrame?.videoHeight, metrics: { fishCount: poseFrame?.metrics?.fishCount } };
   state.liveDetections = detections;
   renderPose(state.frame);
+  const counts = behaviorCounts(detections);
   renderIndividuals(detections);
+  applyBehaviorSummary(counts, counts ? state.lastActivity : null, time, poseFrame?.latencyMs);
+}
+
+function syncAnalyzeFrame() {
+  if (state.mode !== 'analyze' || state.source !== 'file') return;
+  const time = video.currentTime || 0;
+  const past = state.poseBuffer.filter(item => finite(item.time) && item.time <= time + 1e-3);
+  renderLiveAt(time, past.length ? past[past.length - 1] : null);
+  state.pendingBehavior = state.pendingBehavior.filter(message => {
+    if (message.windowEnd > time + 1e-3) return true;
+    commitBehavior(message);
+    return false;
+  });
+}
+
+function commitBehavior(message) {
+  if (!finite(message.windowEnd) || message.windowEnd === state.lastBehaviorTime) return;
+  const now = Math.max(finite(message.time) ? message.time : 0, message.windowEnd);
+  (message.tracks || []).forEach(track => {
+    if (finite(track.window_end_time) && track.window_end_time <= now + 1e-3) state.behaviorById[track.id] = track;
+  });
+  state.lastBehaviorTime = message.windowEnd;
+  if (finite(message.activityScore)) state.lastActivity = message.activityScore;
+  const poseFrame = state.source === 'file'
+    ? [...state.poseBuffer].reverse().find(item => item.time <= (video.currentTime || 0) + 1e-3)
+    : state.poseBuffer[state.poseBuffer.length - 1];
+  renderLiveAt(state.source === 'file' ? (video.currentTime || 0) : now, poseFrame || null);
+  const counts = behaviorCounts(state.frame?.detections);
+  applyBehaviorSummary(counts, message.activityScore, message.windowEnd, message.latencyMs);
+  if (finite(message.activityScore)) pushActivity(message.windowEnd, message.activityScore);
 }
 
 function applyLiveBehavior(message) {
   if (!state.running || state.paused || state.mode !== 'analyze') return;
-  if (!finite(message.windowStart) || message.windowStart === state.lastBehaviorTime) return;
-  state.lastBehaviorTime = message.windowStart;
-  (message.tracks || []).forEach(track => { state.behaviorById[track.id] = track; });
-  const active = (state.frame?.detections || []).map(det => ({ ...det, behavior: state.behaviorById[det.id]?.behavior }));
-  if (state.frame) state.frame.detections = active;
-  const counts = behaviorCounts(active);
-  renderIndividuals(active);
-  applyBehaviorSummary(counts, message.activityScore, message.windowStart, message.latencyMs);
-  if (finite(message.activityScore)) pushActivity(message.windowStart, message.activityScore);
+  if (!finite(message.windowEnd)) return;
+  if (state.source === 'file' && (video.currentTime || 0) + 1e-3 < message.windowEnd) {
+    if (!state.pendingBehavior.some(item => item.windowEnd === message.windowEnd)) state.pendingBehavior.push(message);
+    return;
+  }
+  commitBehavior(message);
 }
 
 function applyServiceStatus(message) {
   state.service = message;
-  if (!state.running) updateSourceUI();
-  else {
-    $('#engine').textContent = state.mode === 'demo' ? '模拟' : message.engine || '未加载';
-    if (message.poseModel) setStatus('#statusPose', message.poseModel, message.poseModel === '已加载');
-    if (message.behaviorModel) setStatus('#statusBehavior', message.behaviorModel, message.behaviorModel === '已加载');
+  if (message.state === 'running') {
+    state.running = true;
+    state.paused = false;
+  } else if (message.state === 'paused') {
+    state.running = false;
+    state.paused = true;
+  } else if (message.state === 'stopped' || message.state === 'error' || message.state === 'ready') {
+    if (message.state !== 'ready') state.running = false;
+    if (message.state === 'stopped' || message.state === 'error') state.paused = false;
   }
+  updateSourceUI();
+}
+
+async function uploadVideo(file) {
+  const headers = authHeaders({ 'X-Filename': encodeURIComponent(file.name) });
+  const response = await fetch('/api/upload', { method: 'POST', headers, body: file });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(payload.message || '视频上传失败');
+    error.payload = payload;
+    throw error;
+  }
+  state.uploadId = payload.uploadId;
+  return payload.uploadId;
 }
 
 async function startMonitor() {
@@ -559,13 +693,20 @@ async function startMonitor() {
     await addLog('系统异常', '本地结果回放需要导入分析结果。', 'warn');
     return;
   }
-  const result = await request(API.start, { method: 'POST', body: JSON.stringify({ mode }) });
+  if (mode === 'analyze') {
+    if (!state.videoFile) throw Error('后端没有可读取的视频文件');
+    const uploadId = await uploadVideo(state.videoFile);
+    const source = await request(API.source, { method: 'POST', body: JSON.stringify({ type: 'file', name: state.videoFile.name, analyze: true, uploadId }) });
+    state.service = source.status;
+    if (source.log && source.created !== false) showLog(source.log);
+  }
+  const result = await request(API.start, { method: 'POST', body: JSON.stringify({ mode, uploadId: state.uploadId }) });
   state.service = result.status;
   state.mode = mode === 'preview' && state.source === 'file' ? 'preview' : mode === 'camera' ? 'analyze' : mode;
   state.running = true;
   state.paused = false;
   if (result.log && result.created !== false) showLog(result.log);
-  if (state.source === 'file' && mode !== 'analyze') video.play().catch(() => addLog('播放提示', '浏览器阻止自动播放，请使用视频控件播放。', 'warn'));
+  if (state.source === 'file') video.play().catch(() => addLog('播放提示', '浏览器阻止自动播放，请使用视频控件播放。', 'warn'));
   if (state.mode === 'demo' && !state.demoFish.length) {
     const width = pose.clientWidth;
     const height = pose.clientHeight;
@@ -611,10 +752,12 @@ async function stopMonitor() {
 
 function connectSocket() {
   if (location.protocol === 'file:') return;
-  const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-  const socket = new WebSocket(`${protocol}//${location.host}${API.ws}`);
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const token = sessionStorage.getItem('monitorToken');
+  const suffix = token ? `?token=${encodeURIComponent(token)}` : '';
+  const socket = new WebSocket(`${protocol}//${location.host}${API.ws}${suffix}`);
   state.socket = socket;
-  socket.onopen = () => { state.backend = true; };
+  socket.onopen = () => { state.backend = true; updateSourceUI(); };
   socket.onmessage = event => {
     const message = JSON.parse(event.data);
     if (message.type === 'status') applyServiceStatus(message);
@@ -623,12 +766,14 @@ function connectSocket() {
   };
   socket.onclose = () => {
     state.socket = null;
-    if (state.mode === 'analyze' && state.running) {
+    state.backend = false;
+    if (state.mode === 'analyze') {
       state.running = false;
-      state.service = { ...(state.service || {}), state: 'error', engine: '未加载', poseModel: '分析服务不可用', behaviorModel: '分析服务不可用' };
+      state.paused = false;
+      state.service = { ...(state.service || {}), state: 'error', engine: '未加载', poseModel: '模型加载失败', behaviorModel: '模型加载失败' };
       addLog('系统异常', '分析连接已断开，监测结果停止更新。', 'danger');
-      updateSourceUI();
     }
+    updateSourceUI();
     setTimeout(connectSocket, 2000);
   };
 }
@@ -673,12 +818,14 @@ $('#videoInput').addEventListener('change', async event => {
   video.src = state.objectUrl;
   video.srcObject = null;
   state.data = null;
+  state.videoFile = file;
+  state.uploadId = '';
   clearResults();
   $('#jsonInput').value = '';
   $('#videoName').textContent = file.name;
   video.load();
   try {
-    const result = await request(API.source, { method: 'POST', body: JSON.stringify({ type: 'file', name: file.name, analyze: $('#backendAnalyze').checked }) });
+    const result = await request(API.source, { method: 'POST', body: JSON.stringify({ type: 'file', name: file.name, analyze: false }) });
     state.backend = true;
     state.service = result.status;
     if (result.log && result.created !== false) showLog(result.log);
@@ -743,8 +890,18 @@ $$('.nav-item').forEach(item => item.addEventListener('click', () => {
   item.classList.add('active');
   document.getElementById(item.dataset.target).scrollIntoView({ behavior: 'smooth', block: 'start' });
 }));
-video.addEventListener('timeupdate', syncFileFrame);
-video.addEventListener('seeked', () => { state.lastBehaviorTime = null; syncFileFrame(); });
+video.addEventListener('timeupdate', () => {
+  if (state.paused) return;
+  syncFileFrame();
+  syncAnalyzeFrame();
+});
+video.addEventListener('seeked', () => {
+  state.lastBehaviorTime = null;
+  state.series = [];
+  state.alertKey = null;
+  if (state.mode === 'playback') relocatePlayback(video.currentTime, false);
+  if (state.mode === 'analyze') syncAnalyzeFrame();
+});
 video.addEventListener('ended', () => {
   if (state.running && state.mode === 'playback') stopMonitor();
 });
@@ -759,6 +916,13 @@ setInterval(() => { if (state.running && state.mode === 'demo') stepDemo(); }, S
 $('#clock').textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
 
 async function boot() {
+  const params = new URLSearchParams(location.search);
+  if (params.has('token')) {
+    sessionStorage.setItem('monitorToken', params.get('token'));
+    params.delete('token');
+    const query = params.toString();
+    history.replaceState(null, '', location.pathname + (query ? `?${query}` : '') + location.hash);
+  }
   try {
     const status = await request(API.status);
     state.backend = true;
