@@ -1,8 +1,11 @@
 {
+  "purpose": "format-test",
   "videoWidth": 1280,
   "videoHeight": 720,
-  "windowSeconds": 2,
-  "engine": "TensorRT FP32",
+  "fps": 30,
+  "windowFrames": 96,
+  "strideFrames": 48,
+  "windowSeconds": 3.2,
   "frames": [
     {
       "time": 0.0,
@@ -28,7 +31,7 @@
       }
     },
     {
-      "time": 1.0,
+      "time": 1.6,
       "detections": [
         {
           "id": 1,
@@ -57,7 +60,7 @@
       }
     },
     {
-      "time": 2.0,
+      "time": 3.2,
       "detections": [
         {
           "id": 1,
@@ -80,7 +83,7 @@
       }
     },
     {
-      "time": 3.0,
+      "time": 4.8,
       "detections": [
         {
           "id": 1,
@@ -109,7 +112,7 @@
       }
     },
     {
-      "time": 4.0,
+      "time": 6.4,
       "detections": [
         {
           "id": 1,

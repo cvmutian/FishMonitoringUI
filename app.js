@@ -1,8 +1,30 @@
-const $ = (s) => document.querySelector(s);
-const $$ = (s) => document.querySelectorAll(s);
+const $ = (selector) => document.querySelector(selector);
+const $$ = (selector) => document.querySelectorAll(selector);
 const LABELS = ['低活动', '正常游动', '快速游动', '急转避让'];
-const state = { source: 'none', running: false, data: null, frame: null, series: [], stream: null,
-  objectUrl: null, demoTick: 0, lastTime: null, alertKey: null, demoFish: [] };
+const SKELETON = [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7], [7, 8], [8, 9], [9, 10], [10, 0]];
+const API = {
+  status: '/api/status',
+  source: '/api/source',
+  start: '/api/monitor/start',
+  pause: '/api/monitor/pause',
+  resume: '/api/monitor/resume',
+  stop: '/api/monitor/stop',
+  params: '/api/params',
+  logs: '/api/logs',
+  frame: '/api/frame',
+  ws: '/ws'
+};
+const WINDOW_FRAMES = 96;
+const STRIDE_FRAMES = 48;
+const FPS = 30;
+const WINDOW_SECONDS = WINDOW_FRAMES / FPS;
+const STRIDE_SECONDS = STRIDE_FRAMES / FPS;
+const state = {
+  source: 'none', running: false, paused: false, mode: 'idle', backend: false, socket: null,
+  data: null, frame: null, series: [], stream: null, objectUrl: null, demoTick: 0, demoFish: [],
+  lastBehaviorTime: null, alertKey: null, liveDetections: [], behaviorById: {}, service: null,
+  applyingParams: false
+};
 const video = $('#video');
 const stage = $('#videoStage');
 const pose = $('#poseCanvas');
@@ -11,147 +33,242 @@ const activity = $('#activityChart');
 const pctx = pose.getContext('2d');
 const bctx = behavior.getContext('2d');
 const actx = activity.getContext('2d');
-const clamp = (v, low = 0, high = 1) => Math.max(low, Math.min(high, v));
-const finite = (v) => typeof v === 'number' && Number.isFinite(v);
+const clamp = (value, low = 0, high = 1) => Math.max(low, Math.min(high, value));
+const finite = (value) => typeof value === 'number' && Number.isFinite(value);
 
 function resizeCanvas(canvas) {
   const bounds = canvas.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width = Math.max(1, Math.round(bounds.width * dpr));
-  canvas.height = Math.max(1, Math.round(bounds.height * dpr));
-  canvas.getContext('2d').setTransform(dpr, 0, 0, dpr, 0, 0);
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.round(bounds.width * ratio));
+  canvas.height = Math.max(1, Math.round(bounds.height * ratio));
+  canvas.getContext('2d').setTransform(ratio, 0, 0, ratio, 0, 0);
 }
-function addLog(type, message, level = '') {
+
+async function request(path, options = {}) {
+  const response = await fetch(path, {
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    cache: 'no-store',
+    ...options
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(payload.message || '后端请求失败');
+    error.payload = payload;
+    throw error;
+  }
+  return payload;
+}
+
+function showLog(entry) {
   const row = document.createElement('div');
-  row.className = `log-row ${level}`;
-  const stamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-  [stamp, type, message].forEach(text => {
-    const span = document.createElement('span'); span.textContent = text; row.append(span);
+  row.className = `log-row ${entry.level && entry.level !== 'info' ? entry.level : ''}`;
+  const stamp = entry.time ? new Date(entry.time).toLocaleTimeString('zh-CN', { hour12: false }) : new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  [stamp, entry.type, entry.message].forEach(text => {
+    const span = document.createElement('span');
+    span.textContent = text;
+    row.append(span);
   });
   $('#eventLog').prepend(row);
   while ($('#eventLog').children.length > 80) $('#eventLog').lastChild.remove();
 }
+
+async function addLog(type, message, level = 'info') {
+  showLog({ time: new Date().toISOString(), type, message, level });
+  if (!state.backend) return;
+  try { await request(API.logs, { method: 'POST', body: JSON.stringify({ type, message, level }) }); } catch (error) { state.backend = false; }
+}
+
 function setStatus(id, value, ok = false) {
   $(id).textContent = value;
   $(id).classList.toggle('ok', ok);
   $(id).classList.toggle('muted', !ok);
 }
-function updateSourceUI() {
-  const source = state.source;
-  const names = { none: '数据源未接入', file: video.src ? '本地视频已接入' : '等待视频文件', camera: state.stream ? '本机摄像头已接入' : '等待摄像头', demo: '界面演示' };
-  $('#sourceBadge').textContent = names[source];
-  $('#sourceBadge').classList.toggle('online', source === 'demo' || Boolean(video.src || state.stream));
-  $('#runBadge').textContent = state.running ? '监测中' : $('#runBadge').dataset.paused === '1' ? '已暂停' : '监测未启动';
-  $('#runBadge').classList.toggle('online', state.running);
-  $('#videoFileLabel').hidden = source !== 'file';
-  $('#jsonFileLabel').hidden = source !== 'file';
-  const canRun = source === 'demo' || (source === 'file' && Boolean(video.src)) || (source === 'camera' && Boolean(state.stream));
-  $('#togglePlayBtn').disabled = !canRun;
-  $('#stopBtn').disabled = !canRun;
-  $('#togglePlayBtn').textContent = state.running ? '暂停监测' : $('#runBadge').dataset.paused === '1' ? '继续监测' : '开始监测';
-  stage.classList.toggle('has-video', Boolean(video.src || state.stream));
-  stage.classList.toggle('is-running', state.running && source === 'demo');
-  $('#modeLabel').textContent = source === 'demo' ? '界面演示：所有数值均为模拟数据' : source === 'camera' ? '本机摄像头预览：等待工控机分析服务' : source === 'file' ? state.data ? '本地视频 · 已导入分析结果' : '本地视频 · 尚无分析结果' : '等待选择数据源';
-  $('#stageTag').textContent = source === 'demo' ? '模拟数据' : source === 'file' && state.data ? '导入分析结果' : source === 'camera' ? '仅摄像头预览' : source === 'file' ? '仅视频预览' : '未接入';
-  $('#sourceHint').textContent = source === 'camera' ? '浏览器需在 localhost 或 HTTPS 下获得摄像头授权；预览不执行模型推理。' : source === 'demo' ? '演示数据由页面随机生成，仅用于验证界面交互。' : '导入本地视频和配套 JSON 后可同步展示姿态与行为结果。';
-  setStatus('#statusVideo', source === 'demo' ? '模拟场景' : video.src || state.stream ? '已接入' : '未接入', canRun);
-  setStatus('#statusPose', state.running && source === 'demo' ? '演示数据' : state.running && state.data ? '导入结果' : '等待数据', state.running && (source === 'demo' || Boolean(state.data)));
-  setStatus('#statusBehavior', state.running && source === 'demo' ? '演示数据' : state.running && state.data ? '导入结果' : '等待数据', state.running && (source === 'demo' || Boolean(state.data)));
-  $('#engine').textContent = state.running && source === 'demo' ? '模拟' : state.running && state.data ? state.data.engine || '未提供' : '未连接';
+
+function windowLabel() {
+  const frames = state.data?.windowFrames || state.service?.params?.windowFrames || WINDOW_FRAMES;
+  const seconds = state.data?.windowSeconds || WINDOW_SECONDS;
+  return `${frames} 帧 / ${Number(seconds).toFixed(1)} 秒`;
 }
+
+function updateSourceUI() {
+  const names = { none: '数据源未接入', file: video.src ? '本地视频已接入' : '等待视频文件', camera: state.stream ? '本机摄像头已接入' : '等待摄像头', ipc: '工控机摄像头', demo: '界面演示' };
+  const connected = state.source === 'demo' || Boolean(video.src || state.stream) || (state.source === 'ipc' && state.service?.sourceConnected);
+  $('#sourceBadge').textContent = state.backend ? names[state.source] || '数据源未接入' : '后端未连接';
+  $('#sourceBadge').classList.toggle('online', state.backend && connected);
+  const runText = !state.backend ? '未连接' : state.mode === 'demo' && state.running ? '演示中' : state.mode === 'preview' && state.running ? '仅预览' : state.running ? '监测中' : state.paused ? '已暂停' : state.service?.state === 'stopped' ? '已停止' : state.service?.state === 'error' ? '运行异常' : '已就绪';
+  $('#runBadge').textContent = runText;
+  $('#runBadge').classList.toggle('online', state.running && state.mode !== 'demo' && state.mode !== 'preview');
+  $('#videoFileLabel').hidden = state.source !== 'file';
+  $('#jsonFileLabel').hidden = state.source !== 'file';
+  $('#backendAnalyzeLabel').hidden = state.source !== 'file';
+  const canRun = state.backend && (state.source === 'demo' || (state.source === 'file' && Boolean(video.src)) || (state.source === 'camera' && Boolean(state.stream)) || (state.source === 'ipc' && state.service?.sourceConnected));
+  $('#togglePlayBtn').disabled = !canRun;
+  $('#stopBtn').disabled = !state.backend || (!state.running && !state.paused && state.service?.state !== 'error');
+  $('#togglePlayBtn').textContent = state.running ? '暂停监测' : state.paused ? '继续监测' : '开始监测';
+  stage.classList.toggle('has-video', Boolean(video.src || state.stream));
+  stage.classList.toggle('is-running', state.running && state.source === 'demo');
+  const analyze = $('#backendAnalyze').checked;
+  const formatTest = state.data?.purpose === 'format-test';
+  $('#modeLabel').textContent = !state.backend ? '后端未连接' : state.source === 'demo' ? '界面演示：所有数值均为模拟数据' : state.source === 'camera' ? '本机摄像头预览，不执行模型推理' : state.source === 'ipc' ? '工控机摄像头由后端采集' : state.source === 'file' && analyze ? '本地视频将提交后端分析' : state.source === 'file' && state.data ? (formatTest ? '本地视频 · 测试数据' : '本地视频 · 已导入分析结果') : state.source === 'file' ? '本地视频 · 尚无分析结果' : '等待选择数据源';
+  $('#stageTag').textContent = state.source === 'demo' ? '模拟数据' : formatTest ? '测试数据' : state.mode === 'analyze' ? '后端分析' : state.source === 'file' && state.data ? '导入分析结果' : state.source === 'camera' ? '仅摄像头预览' : state.source === 'ipc' ? '工控机摄像头' : state.source === 'file' ? '仅视频预览' : '未接入';
+  $('#sourceHint').textContent = state.source === 'camera' ? '浏览器预览不执行姿态检测或行为分析。' : state.source === 'ipc' ? '真实监测由后端采集并推理；模型未加载时不会生成结果。' : state.source === 'demo' ? '演示数据只用于界面测试，不会写入真实监测结果。' : analyze ? '未加载模型时，后端会拒绝分析且页面不显示检测结果。' : '导入本地视频和配套 JSON 后，可按时间轴查看姿态与行为。';
+  $('#behaviorWindowLabel').textContent = windowLabel();
+  const service = state.service || {};
+  setStatus('#statusVideo', !state.backend ? '未连接' : connected ? '已接入' : '未接入', connected && state.backend);
+  const poseText = state.mode === 'demo' && state.running ? '演示数据' : state.mode === 'playback' && state.running ? (formatTest ? '测试数据' : '导入结果') : service.poseModel || '模型未加载';
+  const behaviorText = state.mode === 'demo' && state.running ? '演示数据' : state.mode === 'playback' && state.running ? (formatTest ? '测试数据' : '导入结果') : service.behaviorModel || '模型未加载';
+  setStatus('#statusPose', poseText, poseText === '已加载' || poseText === '导入结果');
+  setStatus('#statusBehavior', behaviorText, behaviorText === '已加载' || behaviorText === '导入结果');
+  const engine = state.mode === 'demo' ? '模拟' : formatTest ? '测试数据' : service.engine || state.data?.engine || '未加载';
+  $('#engine').textContent = engine;
+}
+
 function clearResults() {
-  state.frame = null; state.series = []; state.lastTime = null; state.alertKey = null;
+  state.frame = null;
+  state.series = [];
+  state.lastBehaviorTime = null;
+  state.alertKey = null;
+  state.liveDetections = [];
+  state.behaviorById = {};
+  state.demoFish = [];
   ['#fishCount', '#activityScore', '#behaviorState', '#behaviorRatio', '#kpConf', '#latency'].forEach(id => $(id).textContent = '—');
-  $('#riskLevel').textContent = '—'; $('#riskReason').textContent = '等待有效分析数据';
+  $('#riskLevel').textContent = '—';
+  $('#riskReason').textContent = '等待有效分析数据';
   $('#riskCard').classList.remove('warning', 'danger');
   $('#individualRows').replaceChildren(Object.assign(document.createElement('p'), { className: 'empty-data', textContent: '等待分析结果' }));
-  drawCharts(); drawOverlay();
-}
-function releaseSource() {
-  state.running = false;
-  if (state.stream) { state.stream.getTracks().forEach(track => track.stop()); state.stream = null; }
-  video.pause(); video.srcObject = null; video.removeAttribute('src'); video.load();
-  if (state.objectUrl) { URL.revokeObjectURL(state.objectUrl); state.objectUrl = null; }
-  state.data = null; $('#videoName').textContent = '未导入视频';
-  $('#videoInput').value = ''; $('#jsonInput').value = '';
-  $('#runBadge').dataset.paused = '0'; clearResults(); updateSourceUI();
-}
-async function chooseSource(source) {
-  releaseSource(); state.source = source; updateSourceUI();
-  if (source === 'camera') {
-    try {
-      if (!navigator.mediaDevices?.getUserMedia) throw Error('当前环境无法访问摄像头；请在 localhost 或 HTTPS 打开。');
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-      if (state.source !== source) { stream.getTracks().forEach(t => t.stop()); return; }
-      state.stream = stream;
-      video.srcObject = stream; video.play().catch(() => {});
-      addLog('视频接入', '本机摄像头预览已接入，尚未连接分析服务。');
-    } catch (error) { addLog('接入失败', error.message || '摄像头权限或设备不可用。', 'danger'); }
-  } else if (source === 'demo') addLog('演示模式', '模拟数据已就绪，可开始监测。');
-  updateSourceUI();
-}
-function normalizeJSON(raw) {
-  if (!raw || !Array.isArray(raw.frames) || !raw.frames.length) throw Error('JSON 需要非空 frames 数组。');
-  const frames = raw.frames.map((frame, i) => {
-    if (!finite(frame.time) || frame.time < 0 || !Array.isArray(frame.detections)) throw Error(`第 ${i + 1} 帧缺少有效 time 或 detections。`);
-    if (frame.metrics && (typeof frame.metrics !== 'object' || Array.isArray(frame.metrics))) throw Error(`第 ${i + 1} 帧 metrics 无效。`);
-    frame.detections.forEach((det, j) => {
-      if (!det || typeof det !== 'object' || Array.isArray(det)) throw Error(`第 ${i + 1} 帧第 ${j + 1} 个鱼体数据无效。`);
-      if (det.bbox && (!Array.isArray(det.bbox) || det.bbox.length !== 4 || !det.bbox.every(finite))) throw Error(`第 ${i + 1} 帧第 ${j + 1} 个检测框无效。`);
-      if (det.keypoints && (!Array.isArray(det.keypoints) || det.keypoints.length !== 11 || det.keypoints.some(k => !Array.isArray(k) || k.length < 2 || !finite(k[0]) || !finite(k[1]) || (k.length > 2 && !finite(k[2]))))) throw Error(`第 ${i + 1} 帧第 ${j + 1} 个目标需提供 11 个有效关键点。`);
-    });
-    const values = frame.metrics?.behavior;
-    if (values !== undefined && (!Array.isArray(values) || values.length !== 4 || values.some(v => !finite(v) || v < 0))) throw Error(`第 ${i + 1} 帧的 behavior 应为四项非负数。`);
-    return frame;
-  }).sort((a, b) => a.time - b.time);
-  if (raw.videoWidth !== undefined && (!finite(raw.videoWidth) || raw.videoWidth <= 0)) throw Error('videoWidth 无效。');
-  if (raw.videoHeight !== undefined && (!finite(raw.videoHeight) || raw.videoHeight <= 0)) throw Error('videoHeight 无效。');
-  return { frames, videoWidth: raw.videoWidth, videoHeight: raw.videoHeight, engine: typeof raw.engine === 'string' ? raw.engine.slice(0, 50) : null, windowSeconds: raw.windowSeconds };
-}
-function nearestFrame(seconds) {
-  const frames = state.data.frames;
-  let lo = 0, hi = frames.length;
-  while (lo < hi) { const mid = (lo + hi) >>> 1; if (frames[mid].time < seconds) lo = mid + 1; else hi = mid; }
-  const later = frames[Math.min(lo, frames.length - 1)];
-  const earlier = frames[Math.max(lo - 1, 0)];
-  const closest = Math.abs(later.time - seconds) < Math.abs(earlier.time - seconds) ? later : earlier;
-  // Do not display stale detections if video and JSON timestamps do not align.
-  return Math.abs(closest.time - seconds) <= 0.5 ? closest : null;
-}
-function renderFrame(frame) {
-  state.frame = frame;
-  const metrics = frame?.metrics || {};
-  const dets = frame?.detections || [];
-  const behaviors = metrics.behavior || (dets.some(d => d.behavior !== undefined)
-    ? LABELS.map((label, i) => dets.filter(d => d.behavior === i || d.behavior === label).length)
-    : null);
-  const total = Array.isArray(behaviors) ? behaviors.reduce((a,b) => a+b, 0) : 0;
-  const count = finite(metrics.fishCount) ? metrics.fishCount : frame ? dets.length : null;
-  const score = finite(metrics.activityScore) ? clamp(metrics.activityScore) : null;
-  $('#fishCount').textContent = count === null ? '—' : String(count);
-  $('#activityScore').textContent = score === null ? '—' : score.toFixed(2);
-  const leader = total > 0 ? behaviors.indexOf(Math.max(...behaviors)) : -1;
-  $('#behaviorState').textContent = leader < 0 ? '—' : LABELS[leader];
-  $('#behaviorRatio').textContent = leader < 0 ? '等待行为分析结果' : `占比 ${Math.round(behaviors[leader] / total * 100)}%`;
-  const scores = dets.flatMap(d => d.keypoints || []).map(k => k[2]).filter(finite);
-  const confidence = finite(metrics.confidence) ? metrics.confidence : scores.length ? scores.reduce((a,b) => a+b, 0)/scores.length : null;
-  $('#kpConf').textContent = confidence === null ? '—' : confidence.toFixed(2);
-  $('#latency').textContent = finite(metrics.latencyMs) ? `${metrics.latencyMs.toFixed(1)} ms` : '—';
-  renderIndividuals(dets);
-  updateRisk(score, total > 0 ? behaviors[3] / total * 100 : null, frame?.time);
-  drawCharts(behaviors);
+  drawCharts();
   drawOverlay();
 }
+
+function releaseLocalMedia() {
+  if (state.stream) {
+    state.stream.getTracks().forEach(track => track.stop());
+    state.stream = null;
+  }
+  video.pause();
+  video.srcObject = null;
+  video.removeAttribute('src');
+  video.load();
+  if (state.objectUrl) {
+    URL.revokeObjectURL(state.objectUrl);
+    state.objectUrl = null;
+  }
+  state.data = null;
+  $('#videoName').textContent = '未导入视频';
+  $('#videoInput').value = '';
+  $('#jsonInput').value = '';
+}
+
+async function chooseSource(source) {
+  if (state.backend && (state.running || state.paused)) {
+    try { await request(API.stop, { method: 'POST', body: '{}' }); } catch (error) { state.backend = false; }
+  }
+  state.running = false;
+  state.paused = false;
+  state.mode = 'idle';
+  releaseLocalMedia();
+  clearResults();
+  state.source = source;
+  const payload = { type: source === 'camera' ? 'preview' : source === 'ipc' ? 'camera' : source, name: '', analyze: false };
+  try {
+    const result = await request(API.source, { method: 'POST', body: JSON.stringify(payload) });
+    state.backend = true;
+    state.service = result.status;
+    if (result.log && result.created !== false) showLog(result.log);
+  } catch (error) {
+    state.backend = false;
+    state.service = null;
+    await addLog('系统异常', error.message || '无法连接后端。', 'danger');
+  }
+  if (source === 'camera') await openPreviewCamera();
+  updateSourceUI();
+}
+
+async function openPreviewCamera() {
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw Error('当前环境无法访问摄像头。');
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    if (state.source !== 'camera') {
+      stream.getTracks().forEach(track => track.stop());
+      return;
+    }
+    state.stream = stream;
+    video.srcObject = stream;
+    video.play().catch(() => {});
+    await addLog('视频数据源接入', '本机摄像头预览已接入，不执行模型推理。');
+  } catch (error) {
+    await addLog('视频流异常', error.message || '摄像头不可用。', 'danger');
+  }
+}
+
+function normalizeJSON(raw) {
+  if (!raw || !Array.isArray(raw.frames) || !raw.frames.length) throw Error('JSON 需要非空 frames 数组。');
+  const frames = raw.frames.map((frame, index) => {
+    if (!finite(frame.time) || frame.time < 0 || !Array.isArray(frame.detections)) throw Error(`第 ${index + 1} 帧缺少有效 time 或 detections。`);
+    frame.detections.forEach((det, detIndex) => {
+      if (!det || typeof det !== 'object') throw Error(`第 ${index + 1} 帧第 ${detIndex + 1} 个鱼体数据无效。`);
+      if (det.bbox && (!Array.isArray(det.bbox) || det.bbox.length !== 4 || !det.bbox.every(finite))) throw Error(`第 ${index + 1} 帧检测框无效。`);
+      if (det.keypoints && (!Array.isArray(det.keypoints) || det.keypoints.length !== 11)) throw Error(`第 ${index + 1} 帧需要 11 个关键点。`);
+    });
+    return frame;
+  }).sort((a, b) => a.time - b.time);
+  return {
+    frames,
+    videoWidth: raw.videoWidth,
+    videoHeight: raw.videoHeight,
+    engine: typeof raw.engine === 'string' ? raw.engine : null,
+    windowSeconds: finite(raw.windowSeconds) ? raw.windowSeconds : WINDOW_SECONDS,
+    windowFrames: raw.windowFrames || WINDOW_FRAMES,
+    strideFrames: raw.strideFrames || STRIDE_FRAMES,
+    fps: raw.fps || FPS,
+    purpose: raw.purpose || ''
+  };
+}
+
+function nearestFrame(seconds) {
+  const frames = state.data.frames;
+  let low = 0;
+  let high = frames.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (frames[mid].time < seconds) low = mid + 1;
+    else high = mid;
+  }
+  const later = frames[Math.min(low, frames.length - 1)];
+  const earlier = frames[Math.max(low - 1, 0)];
+  const closest = Math.abs(later.time - seconds) < Math.abs(earlier.time - seconds) ? later : earlier;
+  return Math.abs(closest.time - seconds) <= STRIDE_SECONDS / 2 ? closest : null;
+}
+
+function behaviorCounts(detections) {
+  if (!detections?.length) return null;
+  const known = detections.filter(det => Number.isInteger(det.behavior) && det.behavior >= 0 && det.behavior < 4 || LABELS.includes(det.behavior));
+  if (!known.length) return null;
+  return LABELS.map((label, index) => known.filter(det => det.behavior === index || det.behavior === label).length);
+}
+
 function renderIndividuals(detections) {
-  const target = $('#individualRows'); target.replaceChildren();
-  if (!detections.length) { target.append(Object.assign(document.createElement('p'), {className:'empty-data',textContent:'当前帧无鱼体实例'})); return; }
-  detections.slice(0, 30).forEach((det, i) => {
-    const row = document.createElement('div'); row.className = 'individual-row';
+  const target = $('#individualRows');
+  target.replaceChildren();
+  if (!detections.length) {
+    target.append(Object.assign(document.createElement('p'), { className: 'empty-data', textContent: '当前帧无鱼体实例' }));
+    return;
+  }
+  detections.slice(0, 30).forEach((det, index) => {
+    const row = document.createElement('div');
+    row.className = 'individual-row';
     const category = Number.isInteger(det.behavior) && det.behavior >= 0 && det.behavior < 4 ? LABELS[det.behavior] : LABELS.includes(det.behavior) ? det.behavior : '待分析';
-    [String(det.id ?? i + 1), det.keypoints ? `${det.keypoints.length}/11` : '—', category].forEach(v => {const span = document.createElement('span'); span.textContent = v; row.append(span);});
+    const points = det.keypoints || [];
+    const validCount = points.filter(pointValid).length;
+    [String(det.id ?? index + 1), points.length ? `${validCount}/11` : '—', category].forEach(value => {
+      const span = document.createElement('span');
+      span.textContent = value;
+      row.append(span);
+    });
     target.append(row);
   });
 }
+
 function updateRisk(activityScore, sharpPercent, frameTime) {
   const high = sharpPercent !== null && sharpPercent >= Number($('#turnThreshold').value);
   const medium = activityScore !== null && activityScore >= Number($('#activityThreshold').value);
@@ -161,137 +278,515 @@ function updateRisk(activityScore, sharpPercent, frameTime) {
   $('#riskCard').classList.toggle('danger', high);
   $('#riskCard').classList.toggle('warning', !high && medium);
   const key = high ? 'sharp' : medium ? 'activity' : null;
-  if (state.running && key && key !== state.alertKey) addLog('状态提示', `${state.source === 'demo' ? '模拟数据；' : ''}${$('#riskReason').textContent}${finite(frameTime) ? `；视频时间 ${frameTime.toFixed(2)} s` : ''}`, high ? 'danger' : 'warn');
+  if (state.running && key && key !== state.alertKey) addLog('行为状态提示', $('#riskReason').textContent + (finite(frameTime) ? `；时间 ${Number(frameTime).toFixed(2)} s` : ''), high ? 'danger' : 'warn');
   state.alertKey = key;
 }
+
+function applyBehaviorSummary(counts, activityScore, frameTime, latencyMs) {
+  const total = counts ? counts.reduce((sum, value) => sum + value, 0) : 0;
+  const leader = total > 0 ? counts.indexOf(Math.max(...counts)) : -1;
+  $('#behaviorState').textContent = leader < 0 ? '待分析' : LABELS[leader];
+  $('#behaviorRatio').textContent = leader < 0 ? '等待行为分析结果' : `占比 ${Math.round(counts[leader] / total * 100)}%`;
+  $('#activityScore').textContent = finite(activityScore) ? clamp(activityScore).toFixed(2) : '—';
+  const formatTest = state.data?.purpose === 'format-test';
+  $('#latency').textContent = !formatTest && finite(latencyMs) ? `${latencyMs.toFixed(1)} ms` : '—';
+  updateRisk(finite(activityScore) ? clamp(activityScore) : null, total > 0 ? counts[3] / total * 100 : null, frameTime);
+  drawCharts(total > 0 ? counts : null);
+}
+
+function pushActivity(time, score) {
+  if (!finite(time) || !finite(score)) return;
+  if (state.series.some(point => point.t === time)) return;
+  state.series.push({ t: time, v: clamp(score) });
+  state.series = state.series.filter(point => point.t <= time).slice(-60);
+  drawCharts();
+}
+
+function renderPose(frame) {
+  state.frame = frame;
+  const detections = frame?.detections || [];
+  $('#fishCount').textContent = frame ? String(finite(frame.metrics?.fishCount) ? frame.metrics.fishCount : detections.length) : '—';
+  const scores = detections.flatMap(det => det.keypoints || []).filter(pointValid).map(point => point[2]).filter(finite);
+  $('#kpConf').textContent = scores.length ? (scores.reduce((sum, value) => sum + value, 0) / scores.length).toFixed(2) : '—';
+  const withBehavior = detections.map(det => ({ ...det, behavior: det.behavior }));
+  renderIndividuals(withBehavior);
+  drawOverlay();
+}
+
+function renderFrame(frame, acceptBehavior) {
+  renderPose(frame);
+  if (!acceptBehavior) return;
+  const counts = behaviorCounts(frame?.detections) || (Array.isArray(frame?.metrics?.behavior) ? frame.metrics.behavior : null);
+  applyBehaviorSummary(counts, frame?.metrics?.activityScore, frame?.time, frame?.metrics?.latencyMs);
+  if (finite(frame?.metrics?.activityScore)) pushActivity(frame.time, frame.metrics.activityScore);
+}
+
 function drawBehavior(values) {
-  const w = behavior.clientWidth, h = behavior.clientHeight;
-  bctx.clearRect(0,0,w,h); const x=w/2,y=h/2,r=Math.min(w,h)*0.33;
-  const total = values?.reduce((a,b) => a+b,0) || 0;
-  const colors=['#6aa9ff','#36d399','#ffd166','#ff5d73'];
-  let start=-Math.PI/2;
-  (total ? values : [1,0,0,0]).forEach((v,i) => {
-    if (!v) return;
-    const end=start + (total ? v/total : 1)*Math.PI*2;
-    bctx.beginPath(); bctx.arc(x,y,r,start,end); bctx.arc(x,y,r*0.62,end,start,true); bctx.closePath();
-    bctx.fillStyle=total?colors[i]:'rgba(255,255,255,.09)';bctx.fill(); start=end;
-  });
-  bctx.fillStyle='#e8f7ff'; bctx.textAlign='center'; bctx.font='700 26px sans-serif';
-  bctx.fillText(total?`${Math.round(Math.max(...values)/total*100)}%`:'—',x,y+8);
-  bctx.fillStyle='#8eb3c7';bctx.font='14px sans-serif';bctx.fillText(total?LABELS[values.indexOf(Math.max(...values))]:'等待数据',x,y+32);
+  const width = behavior.clientWidth;
+  const height = behavior.clientHeight;
+  bctx.clearRect(0, 0, width, height);
+  const x = width / 2;
+  const y = height / 2;
+  const radius = Math.min(width, height) * 0.33;
+  const total = values?.reduce((sum, value) => sum + value, 0) || 0;
+  const colors = ['#6aa9ff', '#36d399', '#ffd166', '#ff5d73'];
+  let start = -Math.PI / 2;
+  if (!total) {
+    bctx.beginPath();
+    bctx.arc(x, y, radius, 0, Math.PI * 2);
+    bctx.arc(x, y, radius * 0.62, 0, Math.PI * 2, true);
+    bctx.fillStyle = 'rgba(255,255,255,.09)';
+    bctx.fill();
+  } else {
+    values.forEach((value, index) => {
+      if (!value) return;
+      const end = start + value / total * Math.PI * 2;
+      bctx.beginPath();
+      bctx.arc(x, y, radius, start, end);
+      bctx.arc(x, y, radius * 0.62, end, start, true);
+      bctx.closePath();
+      bctx.fillStyle = colors[index];
+      bctx.fill();
+      start = end;
+    });
+  }
+  bctx.fillStyle = '#e8f7ff';
+  bctx.textAlign = 'center';
+  bctx.font = '700 26px sans-serif';
+  bctx.fillText(total ? `${Math.round(Math.max(...values) / total * 100)}%` : '—', x, y + 8);
+  bctx.fillStyle = '#8eb3c7';
+  bctx.font = '14px sans-serif';
+  bctx.fillText(total ? LABELS[values.indexOf(Math.max(...values))] : '等待分析', x, y + 32);
 }
+
 function drawActivity() {
-  const w=activity.clientWidth,h=activity.clientHeight,p=32;
-  actx.clearRect(0,0,w,h); if(w<=p*2||h<=p*2)return;
-  actx.strokeStyle='rgba(144,220,255,.15)';actx.lineWidth=1;
-  for(let i=0;i<=4;i++){const y=p+i*(h-2*p)/4;actx.beginPath();actx.moveTo(p,y);actx.lineTo(w-p,y);actx.stroke();}
-  const threshold=Number($('#activityThreshold').value),y=p+(1-threshold)*(h-2*p);
-  actx.setLineDash([5,5]);actx.strokeStyle='#ffd166';actx.beginPath();actx.moveTo(p,y);actx.lineTo(w-p,y);actx.stroke();actx.setLineDash([]);
-  const series=state.series;if(!series.length)return;
-  actx.strokeStyle='#45d6ff';actx.lineWidth=2.5;actx.beginPath();
-  series.forEach((v,i)=>{const x=p+(i/Math.max(series.length-1,1))*(w-2*p), yy=p+(1-v)*(h-2*p);i?actx.lineTo(x,yy):actx.moveTo(x,yy);});actx.stroke();
+  const width = activity.clientWidth;
+  const height = activity.clientHeight;
+  const pad = 32;
+  actx.clearRect(0, 0, width, height);
+  if (width <= pad * 2 || height <= pad * 2) return;
+  actx.strokeStyle = 'rgba(144,220,255,.15)';
+  actx.lineWidth = 1;
+  for (let index = 0; index <= 4; index += 1) {
+    const y = pad + index * (height - 2 * pad) / 4;
+    actx.beginPath();
+    actx.moveTo(pad, y);
+    actx.lineTo(width - pad, y);
+    actx.stroke();
+  }
+  const threshold = Number($('#activityThreshold').value);
+  const thresholdY = pad + (1 - threshold) * (height - 2 * pad);
+  actx.setLineDash([5, 5]);
+  actx.strokeStyle = '#ffd166';
+  actx.beginPath();
+  actx.moveTo(pad, thresholdY);
+  actx.lineTo(width - pad, thresholdY);
+  actx.stroke();
+  actx.setLineDash([]);
+  const series = state.series;
+  if (!series.length) return;
+  const start = series[0].t;
+  const span = Math.max(series[series.length - 1].t - start, 1e-6);
+  actx.strokeStyle = '#45d6ff';
+  actx.lineWidth = 2.5;
+  actx.beginPath();
+  series.forEach((point, index) => {
+    const x = pad + (point.t - start) / span * (width - 2 * pad);
+    const y = pad + (1 - point.v) * (height - 2 * pad);
+    if (index) actx.lineTo(x, y);
+    else actx.moveTo(x, y);
+  });
+  actx.stroke();
 }
+
 function drawCharts(values) {
-  if (!values && state.frame) {
-    values = state.frame.metrics?.behavior;
-    if (!values && state.frame.detections.some(d => d.behavior !== undefined)) {
-      values = LABELS.map((label, i) => state.frame.detections.filter(d => d.behavior === i || d.behavior === label).length);
+  if (!values && state.frame) values = behaviorCounts(state.frame.detections) || state.frame.metrics?.behavior;
+  drawBehavior(values);
+  drawActivity();
+}
+
+function containBounds(srcW, srcH) {
+  const width = pose.clientWidth;
+  const height = pose.clientHeight;
+  const scale = Math.min(width / srcW, height / srcH);
+  const boxW = srcW * scale;
+  const boxH = srcH * scale;
+  return { x: (width - boxW) / 2, y: (height - boxH) / 2, w: boxW, h: boxH };
+}
+
+function pointValid(point) {
+  if (!Array.isArray(point) || !finite(point[0]) || !finite(point[1])) return false;
+  if (point.length < 3 || !finite(point[2])) return true;
+  return point[2] >= Number($('#confThreshold').value);
+}
+
+function drawOverlay() {
+  pctx.clearRect(0, 0, pose.clientWidth, pose.clientHeight);
+  if (state.source === 'demo' && state.running) {
+    const width = pose.clientWidth;
+    const height = pose.clientHeight;
+    state.demoFish.forEach((fish, index) => {
+      fish.x += fish.vx;
+      fish.y += fish.vy;
+      if (fish.x < 40 || fish.x > width - 40) fish.vx *= -1;
+      if (fish.y < 40 || fish.y > height - 40) fish.vy *= -1;
+      const points = Array.from({ length: 11 }, (_, keypoint) => [fish.x + (keypoint - 5) * 6, fish.y + Math.sin(keypoint * 0.65 + state.demoTick * 0.2 + index) * 7, 0.9]);
+      drawDetection({ bbox: [fish.x - 42, fish.y - 18, 84, 36], keypoints: points }, { x: 0, y: 0, w: width, h: height }, width, height);
+    });
+    return;
+  }
+  const frame = state.frame;
+  if (!frame?.detections) return;
+  const srcW = frame.videoWidth || state.data?.videoWidth || video.videoWidth;
+  const srcH = frame.videoHeight || state.data?.videoHeight || video.videoHeight;
+  if (!srcW || !srcH) return;
+  const bounds = containBounds(srcW, srcH);
+  frame.detections.forEach(det => drawDetection(det, bounds, srcW, srcH));
+}
+
+function drawDetection(det, bounds, srcW, srcH) {
+  const px = value => bounds.x + value * bounds.w / srcW;
+  const py = value => bounds.y + value * bounds.h / srcH;
+  if ($('#showBoxes').checked && det.bbox) {
+    const [x, y, boxW, boxH] = det.bbox;
+    pctx.strokeStyle = '#36d399';
+    pctx.lineWidth = 2;
+    pctx.strokeRect(px(x), py(y), boxW * bounds.w / srcW, boxH * bounds.h / srcH);
+  }
+  if (!$('#showSkeleton').checked || !det.keypoints) return;
+  pctx.strokeStyle = '#45d6ff';
+  pctx.lineWidth = 2;
+  SKELETON.forEach(([start, end]) => {
+    const from = det.keypoints[start];
+    const to = det.keypoints[end];
+    if (!pointValid(from) || !pointValid(to)) return;
+    pctx.beginPath();
+    pctx.moveTo(px(from[0]), py(from[1]));
+    pctx.lineTo(px(to[0]), py(to[1]));
+    pctx.stroke();
+  });
+  pctx.fillStyle = '#ff5d73';
+  det.keypoints.filter(pointValid).forEach(point => {
+    pctx.beginPath();
+    pctx.arc(px(point[0]), py(point[1]), 3, 0, Math.PI * 2);
+    pctx.fill();
+  });
+  if (det.id !== undefined) {
+    const anchor = det.keypoints.find(pointValid) || (det.bbox ? [det.bbox[0], det.bbox[1]] : null);
+    if (anchor) {
+      pctx.fillStyle = '#e8f7ff';
+      pctx.font = '13px sans-serif';
+      pctx.fillText(String(det.id), px(anchor[0]) + 6, py(anchor[1]) - 6);
     }
   }
-  drawBehavior(values); drawActivity();
 }
-function drawOverlay() {
-  const w=pose.clientWidth,h=pose.clientHeight;pctx.clearRect(0,0,w,h);
-  if(!state.running && state.source !== 'file')return;
-  if(state.source==='demo'){
-    state.demoFish.forEach((fish,i)=>{
-      fish.x += fish.vx;fish.y += fish.vy;
-      if(fish.x<40||fish.x>w-40)fish.vx*=-1;
-      if(fish.y<40||fish.y>h-40)fish.vy*=-1;
-      const points=Array.from({length:11},(_,j)=>[fish.x+(j-5)*6, fish.y+Math.sin(j*.65+state.demoTick*.2+i)*7,.9]);
-      drawDetection({bbox:[fish.x-42,fish.y-18,84,36],keypoints:points}, {x:0,y:0,w,h});
-    });return;
-  }
-  if(state.source!=='file'||!state.frame||!video.videoWidth||!video.videoHeight)return;
-  // object-fit: contain leaves letterbox margins; map source coordinates into displayed video content.
-  const srcW=state.data.videoWidth||video.videoWidth,srcH=state.data.videoHeight||video.videoHeight;
-  const scale=Math.min(w/video.videoWidth,h/video.videoHeight);
-  const bounds={x:(w-video.videoWidth*scale)/2,y:(h-video.videoHeight*scale)/2,w:video.videoWidth*scale,h:video.videoHeight*scale};
-  state.frame.detections.forEach(det=>drawDetection(det,bounds,srcW,srcH));
-}
-function drawDetection(det,bounds,srcW=bounds.w,srcH=bounds.h) {
-  const px=x=>bounds.x+x*bounds.w/srcW,py=y=>bounds.y+y*bounds.h/srcH;
-  if($('#showBoxes').checked&&det.bbox){const [x,y,w,h]=det.bbox;pctx.strokeStyle='#36d399';pctx.lineWidth=2;pctx.strokeRect(px(x),py(y),w*bounds.w/srcW,h*bounds.h/srcH);}
-  if(!$('#showSkeleton').checked||!det.keypoints)return;
-  const limit=Number($('#confThreshold').value);
-  const valid=k=>Array.isArray(k)&&(!finite(k[2])||k[2]>=limit);
-  pctx.strokeStyle='#45d6ff';pctx.lineWidth=2;
-  for(let i=1;i<det.keypoints.length;i++)if(valid(det.keypoints[i-1])&&valid(det.keypoints[i])){
-    pctx.beginPath();pctx.moveTo(px(det.keypoints[i-1][0]),py(det.keypoints[i-1][1]));pctx.lineTo(px(det.keypoints[i][0]),py(det.keypoints[i][1]));pctx.stroke();
-  }
-  pctx.fillStyle='#ff5d73';det.keypoints.filter(valid).forEach(k=>{pctx.beginPath();pctx.arc(px(k[0]),py(k[1]),3,0,Math.PI*2);pctx.fill();});
-}
+
 function stepDemo() {
-  state.demoTick++;
-  const score=clamp(.52+Math.sin(state.demoTick*.28)*.17+(Math.random()-.5)*.08);
-  const sharp=Math.round(5+score*18),fast=Math.round(12+score*18),calm=Math.round(24-score*17);
-  const behavior=[calm,100-calm-fast-sharp,fast,sharp];
-  const detections=state.demoFish.map((f,i)=>({id:i+1,behavior:i%4,keypoints:Array.from({length:11},(_,j)=>[f.x+(j-5)*6,f.y+Math.sin(j*.65+state.demoTick*.2+i)*7,.7+Math.random()*.28])}));
-  renderFrame({time:state.demoTick*1.2,detections,metrics:{fishCount:detections.length,activityScore:score,behavior,confidence:.88}});
-  state.series.push(score); if(state.series.length>60)state.series.shift();drawCharts(behavior);
+  state.demoTick += 1;
+  const time = state.demoTick * STRIDE_SECONDS;
+  const score = clamp(0.52 + Math.sin(state.demoTick * 0.28) * 0.17);
+  const detections = state.demoFish.map((fish, index) => ({
+    id: index + 1,
+    behavior: index % 4,
+    keypoints: Array.from({ length: 11 }, () => [0, 0, 0.9])
+  }));
+  const counts = behaviorCounts(detections);
+  state.frame = { time, detections, metrics: { fishCount: detections.length, activityScore: score, behavior: counts } };
+  $('#fishCount').textContent = String(detections.length);
+  renderIndividuals(detections);
+  applyBehaviorSummary(counts, score, time, null);
+  pushActivity(time, score);
+  drawOverlay();
 }
+
 function syncFileFrame() {
-  if(!state.running||state.source!=='file'||!state.data||!video.videoWidth)return;
-  const time=video.currentTime;
-  if(state.lastTime===time)return;
-  if(state.lastTime!==null&&time<state.lastTime-.5){state.series=[];state.alertKey=null;}
-  state.lastTime=time;
-  const frame=nearestFrame(time);renderFrame(frame);
-  if(frame&&finite(frame.metrics?.activityScore)){
-    state.series.push(clamp(frame.metrics.activityScore));if(state.series.length>60)state.series.shift();drawCharts();
+  if (!state.running || state.paused || state.mode !== 'playback' || !state.data || !video.videoWidth) return;
+  const time = video.currentTime;
+  if (state.lastBehaviorTime !== null && time < state.lastBehaviorTime - STRIDE_SECONDS) {
+    state.series = state.series.filter(point => point.t <= time);
+    state.lastBehaviorTime = null;
+    state.alertKey = null;
+  }
+  const frame = nearestFrame(time);
+  renderPose(frame ? { ...frame, videoWidth: state.data.videoWidth, videoHeight: state.data.videoHeight } : null);
+  if (!frame || frame.time === state.lastBehaviorTime) return;
+  const counts = behaviorCounts(frame.detections);
+  if (!counts && !frame.metrics) return;
+  state.lastBehaviorTime = frame.time;
+  renderIndividuals(frame.detections);
+  applyBehaviorSummary(counts || frame.metrics?.behavior, frame.metrics?.activityScore, frame.time, frame.metrics?.latencyMs);
+  if (finite(frame.metrics?.activityScore)) pushActivity(frame.time, frame.metrics.activityScore);
+}
+
+function applyLivePose(message) {
+  if (!state.running || state.paused || state.mode !== 'analyze') return;
+  const seen = new Set((message.detections || []).map(det => det.id));
+  Object.keys(state.behaviorById).forEach(id => { if (!seen.has(Number(id)) && !seen.has(id)) delete state.behaviorById[id]; });
+  const detections = (message.detections || []).map(det => ({ ...det, behavior: state.behaviorById[det.id]?.behavior }));
+  state.frame = { detections, videoWidth: message.videoWidth, videoHeight: message.videoHeight, metrics: { fishCount: message.fishCount } };
+  state.liveDetections = detections;
+  renderPose(state.frame);
+  renderIndividuals(detections);
+}
+
+function applyLiveBehavior(message) {
+  if (!state.running || state.paused || state.mode !== 'analyze') return;
+  if (!finite(message.windowStart) || message.windowStart === state.lastBehaviorTime) return;
+  state.lastBehaviorTime = message.windowStart;
+  (message.tracks || []).forEach(track => { state.behaviorById[track.id] = track; });
+  const active = (state.frame?.detections || []).map(det => ({ ...det, behavior: state.behaviorById[det.id]?.behavior }));
+  if (state.frame) state.frame.detections = active;
+  const counts = behaviorCounts(active);
+  renderIndividuals(active);
+  applyBehaviorSummary(counts, message.activityScore, message.windowStart, message.latencyMs);
+  if (finite(message.activityScore)) pushActivity(message.windowStart, message.activityScore);
+}
+
+function applyServiceStatus(message) {
+  state.service = message;
+  if (!state.running) updateSourceUI();
+  else {
+    $('#engine').textContent = state.mode === 'demo' ? '模拟' : message.engine || '未加载';
+    if (message.poseModel) setStatus('#statusPose', message.poseModel, message.poseModel === '已加载');
+    if (message.behaviorModel) setStatus('#statusBehavior', message.behaviorModel, message.behaviorModel === '已加载');
   }
 }
-function setRunning(running) {
-  if(running&&$('#togglePlayBtn').disabled)return;
-  state.running=running;
-  $('#runBadge').dataset.paused=running?'0':'1';
-  if(running){
-    if(state.source==='file')video.play().catch(()=>addLog('播放提示','浏览器阻止自动播放，请使用视频控件播放。','warn'));
-    if(state.source==='demo'&&!state.demoFish.length){const w=pose.clientWidth,h=pose.clientHeight;state.demoFish=Array.from({length:9},(_,i)=>({x:60+(i%3)*(w-120)/3,y:65+Math.floor(i/3)*(h-130)/3,vx:(i%2?1:-1)*.7,vy:.35}));}
-    addLog('监测启动','已开始或恢复监测。');
-  }else{if(state.source==='file')video.pause();addLog('监测暂停','画面与当前分析结果已保留。');}
-  updateSourceUI();drawOverlay();
+
+async function startMonitor() {
+  const analyze = state.source === 'file' && $('#backendAnalyze').checked;
+  const mode = state.source === 'demo' ? 'demo' : state.source === 'camera' ? 'preview' : state.source === 'ipc' ? 'camera' : analyze ? 'analyze' : state.data ? 'playback' : 'preview';
+  if (mode === 'playback' && !state.data) {
+    await addLog('系统异常', '本地结果回放需要导入分析结果。', 'warn');
+    return;
+  }
+  const result = await request(API.start, { method: 'POST', body: JSON.stringify({ mode }) });
+  state.service = result.status;
+  state.mode = mode === 'preview' && state.source === 'file' ? 'preview' : mode === 'camera' ? 'analyze' : mode;
+  state.running = true;
+  state.paused = false;
+  if (result.log && result.created !== false) showLog(result.log);
+  if (state.source === 'file' && mode !== 'analyze') video.play().catch(() => addLog('播放提示', '浏览器阻止自动播放，请使用视频控件播放。', 'warn'));
+  if (state.mode === 'demo' && !state.demoFish.length) {
+    const width = pose.clientWidth;
+    const height = pose.clientHeight;
+    state.demoFish = Array.from({ length: 9 }, (_, index) => ({ x: 60 + (index % 3) * (width - 120) / 3, y: 65 + Math.floor(index / 3) * (height - 130) / 3, vx: (index % 2 ? 1 : -1) * 0.7, vy: 0.35 }));
+  }
+  updateSourceUI();
 }
-$('#sourceSelect').addEventListener('change',e=>chooseSource(e.target.value));
-$('#videoInput').addEventListener('change',e=>{
-  const file=e.target.files?.[0];if(!file)return;
-  if(state.objectUrl)URL.revokeObjectURL(state.objectUrl);
-  state.objectUrl=URL.createObjectURL(file);video.src=state.objectUrl;video.srcObject=null;
-  state.data=null;clearResults();$('#jsonInput').value='';$('#videoName').textContent=file.name;
-  video.load();updateSourceUI();addLog('视频接入',`已加载本地视频：${file.name}`);
+
+async function pauseMonitor() {
+  const result = await request(API.pause, { method: 'POST', body: '{}' });
+  state.service = result.status;
+  state.running = false;
+  state.paused = true;
+  if (state.source === 'file') video.pause();
+  if (result.log && result.created !== false) showLog(result.log);
+  updateSourceUI();
+}
+
+async function resumeMonitor() {
+  const result = await request(API.resume, { method: 'POST', body: '{}' });
+  state.service = result.status;
+  state.running = true;
+  state.paused = false;
+  if (state.source === 'file' && state.mode === 'playback') video.play().catch(() => {});
+  if (result.log && result.created !== false) showLog(result.log);
+  updateSourceUI();
+}
+
+async function stopMonitor() {
+  const result = await request(API.stop, { method: 'POST', body: '{}' });
+  state.service = result.status;
+  state.running = false;
+  state.paused = false;
+  state.mode = 'idle';
+  if (state.source === 'file') {
+    video.pause();
+    video.currentTime = 0;
+  }
+  clearResults();
+  if (result.log && result.created !== false) showLog(result.log);
+  updateSourceUI();
+}
+
+function connectSocket() {
+  if (location.protocol === 'file:') return;
+  const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+  const socket = new WebSocket(`${protocol}//${location.host}${API.ws}`);
+  state.socket = socket;
+  socket.onopen = () => { state.backend = true; };
+  socket.onmessage = event => {
+    const message = JSON.parse(event.data);
+    if (message.type === 'status') applyServiceStatus(message);
+    if (message.type === 'pose') applyLivePose(message);
+    if (message.type === 'behavior') applyLiveBehavior(message);
+  };
+  socket.onclose = () => {
+    state.socket = null;
+    if (state.mode === 'analyze' && state.running) {
+      state.running = false;
+      state.service = { ...(state.service || {}), state: 'error', engine: '未加载', poseModel: '分析服务不可用', behaviorModel: '分析服务不可用' };
+      addLog('系统异常', '分析连接已断开，监测结果停止更新。', 'danger');
+      updateSourceUI();
+    }
+    setTimeout(connectSocket, 2000);
+  };
+}
+
+async function syncParams() {
+  if (state.applyingParams || !state.backend) return;
+  const body = {
+    activityThreshold: Number($('#activityThreshold').value),
+    turnThreshold: Number($('#turnThreshold').value),
+    confThreshold: Number($('#confThreshold').value),
+    fps: FPS,
+    windowFrames: WINDOW_FRAMES,
+    strideFrames: STRIDE_FRAMES
+  };
+  try {
+    const result = await request(API.params, { method: 'POST', body: JSON.stringify(body) });
+    if (state.service) state.service.params = result.params;
+  } catch (error) {
+    state.backend = false;
+    updateSourceUI();
+  }
+}
+
+function applyRemoteParams(params) {
+  if (!params) return;
+  state.applyingParams = true;
+  $('#activityThreshold').value = params.activityThreshold;
+  $('#turnThreshold').value = params.turnThreshold;
+  $('#confThreshold').value = params.confThreshold;
+  $('#activityValue').textContent = Number(params.activityThreshold).toFixed(2);
+  $('#turnValue').textContent = `${params.turnThreshold}%`;
+  $('#confValue').textContent = Number(params.confThreshold).toFixed(2);
+  state.applyingParams = false;
+}
+
+$('#sourceSelect').addEventListener('change', event => chooseSource(event.target.value));
+$('#videoInput').addEventListener('change', async event => {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  if (state.objectUrl) URL.revokeObjectURL(state.objectUrl);
+  state.objectUrl = URL.createObjectURL(file);
+  video.src = state.objectUrl;
+  video.srcObject = null;
+  state.data = null;
+  clearResults();
+  $('#jsonInput').value = '';
+  $('#videoName').textContent = file.name;
+  video.load();
+  try {
+    const result = await request(API.source, { method: 'POST', body: JSON.stringify({ type: 'file', name: file.name, analyze: $('#backendAnalyze').checked }) });
+    state.backend = true;
+    state.service = result.status;
+    if (result.log && result.created !== false) showLog(result.log);
+  } catch (error) {
+    state.backend = false;
+    await addLog('系统异常', error.message || '无法登记视频数据源。', 'danger');
+  }
+  updateSourceUI();
 });
-$('#jsonInput').addEventListener('change',async e=>{
-  const file=e.target.files?.[0];if(!file)return;
-  try { const parsed=normalizeJSON(JSON.parse(await file.text()));state.data=parsed;clearResults();
-    $('#behaviorWindowLabel').textContent=finite(parsed.windowSeconds)?`${parsed.windowSeconds} 秒窗口`:'2 秒窗口';
-    updateSourceUI();addLog('数据接入',`已导入分析结果：${file.name}`);
-  }catch(error){state.data=null;clearResults();updateSourceUI();addLog('数据错误',error.message,'danger');}
+$('#jsonInput').addEventListener('change', async event => {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  try {
+    const parsed = normalizeJSON(JSON.parse(await file.text()));
+    state.data = parsed;
+    clearResults();
+    updateSourceUI();
+    await addLog('视频数据源接入', `已导入分析结果：${file.name}${parsed.purpose === 'format-test' ? '（测试数据）' : ''}`);
+  } catch (error) {
+    state.data = null;
+    clearResults();
+    updateSourceUI();
+    await addLog('系统异常', error.message, 'danger');
+  }
 });
-$('#togglePlayBtn').addEventListener('click',()=>setRunning(!state.running));
-$('#stopBtn').addEventListener('click',()=>{state.running=false;$('#runBadge').dataset.paused='0';if(state.source==='file'){video.pause();video.currentTime=0;}clearResults();updateSourceUI();addLog('监测停止','本次监测已停止，事件日志保留。');});
-$('#clearLog').addEventListener('click',()=>$('#eventLog').replaceChildren());
-['showBoxes','showSkeleton','confThreshold'].forEach(id=>$('#'+id).addEventListener('input',()=>{if(id==='confThreshold')$('#confValue').textContent=Number($('#confThreshold').value).toFixed(2);drawOverlay();}));
-['activityThreshold','turnThreshold'].forEach(id=>$('#'+id).addEventListener('input',()=>{
-  $('#activityValue').textContent=Number($('#activityThreshold').value).toFixed(2);$('#turnValue').textContent=$('#turnThreshold').value+'%';
-  if(state.frame)renderFrame(state.frame);else drawCharts();
+$('#backendAnalyze').addEventListener('change', updateSourceUI);
+$('#togglePlayBtn').addEventListener('click', async () => {
+  try {
+    if (state.running) await pauseMonitor();
+    else if (state.paused) await resumeMonitor();
+    else await startMonitor();
+  } catch (error) {
+    state.running = false;
+    state.service = error.payload?.status || state.service;
+    updateSourceUI();
+    if (error.payload?.log && error.payload.created !== false) showLog(error.payload.log);
+    else await addLog('模型加载失败', error.message, 'danger');
+  }
+});
+$('#stopBtn').addEventListener('click', () => stopMonitor().catch(error => addLog('系统异常', error.message, 'danger')));
+$('#clearLog').addEventListener('click', async () => {
+  $('#eventLog').replaceChildren();
+  if (state.backend) {
+    try { await request(API.logs, { method: 'DELETE' }); } catch (error) { state.backend = false; }
+  }
+});
+['showBoxes', 'showSkeleton', 'confThreshold'].forEach(id => $('#' + id).addEventListener('input', () => {
+  if (id === 'confThreshold') $('#confValue').textContent = Number($('#confThreshold').value).toFixed(2);
+  if (state.frame) renderIndividuals(state.frame.detections || []);
+  drawOverlay();
+  if (id === 'confThreshold') syncParams();
 }));
-$$('.nav-item').forEach(item=>item.addEventListener('click',()=>{$$('.nav-item').forEach(n=>n.classList.remove('active'));item.classList.add('active');document.getElementById(item.dataset.target).scrollIntoView({behavior:'smooth',block:'start'});}));
-video.addEventListener('timeupdate',syncFileFrame);
-video.addEventListener('seeked',()=>{state.lastTime=null;syncFileFrame();});
-video.addEventListener('ended',()=>{if(state.running&&state.source==='file'){state.running=false;$('#runBadge').dataset.paused='0';updateSourceUI();addLog('监测结束','视频播放结束。');}});
-window.addEventListener('resize',()=>{[pose,behavior,activity].forEach(resizeCanvas);drawCharts();drawOverlay();});
-[pose,behavior,activity].forEach(resizeCanvas);updateSourceUI();drawCharts();
-addLog('系统就绪','请选择本地视频、摄像头预览或界面演示。');
-setInterval(()=>{$('#clock').textContent=new Date().toLocaleTimeString('zh-CN',{hour12:false});},1000);
-setInterval(()=>{if(state.running&&state.source==='demo')stepDemo();},1200);
-$('#clock').textContent=new Date().toLocaleTimeString('zh-CN',{hour12:false});
+['activityThreshold', 'turnThreshold'].forEach(id => $('#' + id).addEventListener('input', () => {
+  $('#activityValue').textContent = Number($('#activityThreshold').value).toFixed(2);
+  $('#turnValue').textContent = `${$('#turnThreshold').value}%`;
+  if (state.frame) renderFrame(state.frame, false);
+  else drawCharts();
+  syncParams();
+}));
+$$('.nav-item').forEach(item => item.addEventListener('click', () => {
+  $$('.nav-item').forEach(node => node.classList.remove('active'));
+  item.classList.add('active');
+  document.getElementById(item.dataset.target).scrollIntoView({ behavior: 'smooth', block: 'start' });
+}));
+video.addEventListener('timeupdate', syncFileFrame);
+video.addEventListener('seeked', () => { state.lastBehaviorTime = null; syncFileFrame(); });
+video.addEventListener('ended', () => {
+  if (state.running && state.mode === 'playback') stopMonitor();
+});
+window.addEventListener('resize', () => {
+  [pose, behavior, activity].forEach(resizeCanvas);
+  drawCharts();
+  drawOverlay();
+});
+[pose, behavior, activity].forEach(resizeCanvas);
+setInterval(() => { $('#clock').textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false }); }, 1000);
+setInterval(() => { if (state.running && state.mode === 'demo') stepDemo(); }, STRIDE_SECONDS * 1000);
+$('#clock').textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+
+async function boot() {
+  try {
+    const status = await request(API.status);
+    state.backend = true;
+    state.service = status;
+    const sourceMap = { preview: 'camera', camera: 'ipc', file: 'file', demo: 'demo', none: 'none' };
+    const uiSource = sourceMap[status.source?.type] || 'none';
+    if (uiSource !== 'none') {
+      state.source = uiSource;
+      $('#sourceSelect').value = uiSource;
+    }
+    state.running = status.state === 'running';
+    state.paused = status.state === 'paused';
+    state.mode = status.state === 'running' || status.state === 'paused' ? status.mode : 'idle';
+    if (state.mode === 'demo' && (state.running || state.paused) && !state.demoFish.length) {
+      const width = pose.clientWidth;
+      const height = pose.clientHeight;
+      state.demoFish = Array.from({ length: 9 }, (_, index) => ({ x: 60 + (index % 3) * (width - 120) / 3, y: 65 + Math.floor(index / 3) * (height - 130) / 3, vx: (index % 2 ? 1 : -1) * 0.7, vy: 0.35 }));
+    }
+    applyRemoteParams(status.params);
+    const logs = await request(`${API.logs}?limit=80`);
+    logs.logs.slice().reverse().forEach(showLog);
+  } catch (error) {
+    state.backend = false;
+    showLog({ time: new Date().toISOString(), type: '系统异常', message: '后端未连接。', level: 'danger' });
+  }
+  updateSourceUI();
+  drawCharts();
+  connectSocket();
+}
+
+boot();

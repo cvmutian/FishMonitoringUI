@@ -44,9 +44,10 @@
 
       <section class="panel source-panel"><h2>数据源与监测</h2>
         <label class="field-label" for="sourceSelect">输入方式</label>
-        <select id="sourceSelect" class="field-select"><option value="none">请选择数据源</option><option value="file">本地视频</option><option value="camera">本机摄像头预览</option><option value="demo">界面演示</option></select>
+        <select id="sourceSelect" class="field-select"><option value="none">请选择数据源</option><option value="file">本地视频</option><option value="camera">本机摄像头预览</option><option value="ipc">工控机摄像头</option><option value="demo">界面演示</option></select>
         <label class="file-btn secondary" id="videoFileLabel">选择视频文件<input type="file" id="videoInput" accept="video/*"></label>
         <label class="file-btn secondary" id="jsonFileLabel">导入分析结果 JSON<input type="file" id="jsonInput" accept=".json,application/json"></label>
+        <label class="check-label" id="backendAnalyzeLabel" hidden><input id="backendAnalyze" type="checkbox"> 提交后端分析</label>
         <div class="source-controls"><button id="togglePlayBtn" disabled>开始监测</button><button id="stopBtn" class="ghost" disabled>停止</button></div>
         <p class="hint" id="sourceHint">本地视频需配套分析结果才能显示检测与行为信息。</p>
       </section>
@@ -113,7 +114,7 @@
         <article class="panel pose-card" id="pose"><div class="section-title compact"><h2>个体姿态与行为</h2><span class="mini-tag">11 个关键点</span></div><p class="panel-note">按鱼体 ID 查看当前帧结果</p><div class="individual-table"><div class="individual-head"><span>鱼体 ID</span><span>关键点</span><span>行为状态</span></div><div id="individualRows"><p class="empty-data">等待分析结果</p></div></div></article>
         <article class="panel chart-card" id="behavior">
           <div class="section-title compact">
-            <h2>鱼群行为分布</h2><span class="mini-tag" id="behaviorWindowLabel">2 秒窗口</span>
+            <h2>鱼群行为分布</h2><span class="mini-tag" id="behaviorWindowLabel">96 帧 / 3.2 秒</span>
           </div>
           <canvas id="behaviorChart"></canvas>
           <div class="legend-row">
@@ -141,7 +142,7 @@
             <div><span>姿态模型</span><b id="statusPose" class="muted">待机中</b></div>
             <div><span>行为分析</span><b id="statusBehavior" class="muted">待机中</b></div>
             <div><span>推理方案</span><b id="engine">未连接</b></div>
-            <div><span>推理延迟</span><b id="latency">-</b></div>
+            <div><span>推理延迟</span><b id="latency">—</b></div>
             <div><span>关键点平均置信度</span><b id="kpConf">-</b></div>
           </div>
         </article>
